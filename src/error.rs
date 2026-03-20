@@ -10,6 +10,12 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -22,6 +28,8 @@ impl IntoResponse for ApiError {
         let (status, message) = match &self {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             ApiError::Db(e) => {
                 tracing::error!("database error: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())

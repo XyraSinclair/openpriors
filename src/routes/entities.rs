@@ -4,12 +4,13 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::auth::AppState;
 use crate::error::ApiError;
 
-pub fn routes() -> Router<PgPool> {
+pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/entities", post(create_entity).get(list_entities))
         .route("/entities/{id}", get(get_entity))
@@ -34,7 +35,7 @@ struct EntityResponse {
 }
 
 async fn create_entity(
-    State(pool): State<PgPool>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<CreateEntity>,
 ) -> Result<Json<EntityResponse>, ApiError> {
     let row = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
@@ -49,16 +50,11 @@ async fn create_entity(
     .bind(&body.name)
     .bind(&body.kind)
     .bind(&body.payload)
-    .fetch_one(&pool)
+    .fetch_one(&state.db)
     .await?;
 
     Ok(Json(EntityResponse {
-        id: row.0,
-        uri: row.1,
-        name: row.2,
-        kind: row.3,
-        payload: row.4,
-        created_at: row.5,
+        id: row.0, uri: row.1, name: row.2, kind: row.3, payload: row.4, created_at: row.5,
     }))
 }
 
@@ -70,7 +66,7 @@ struct ListParams {
 }
 
 async fn list_entities(
-    State(pool): State<PgPool>,
+    State(state): State<Arc<AppState>>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<EntityResponse>>, ApiError> {
     let limit = params.limit.unwrap_or(100).min(1000);
@@ -85,7 +81,7 @@ async fn list_entities(
     .bind(&params.kind)
     .bind(limit)
     .bind(offset)
-    .fetch_all(&pool)
+    .fetch_all(&state.db)
     .await?;
 
     let entities: Vec<_> = rows
@@ -99,14 +95,14 @@ async fn list_entities(
 }
 
 async fn get_entity(
-    State(pool): State<PgPool>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<EntityResponse>, ApiError> {
     let row = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
         "SELECT id, uri, name, kind, payload, created_at FROM entities WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| ApiError::NotFound(format!("entity {id}")))?;
 

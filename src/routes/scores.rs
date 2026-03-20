@@ -4,12 +4,13 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::auth::AppState;
 use crate::error::ApiError;
 
-pub fn routes() -> Router<PgPool> {
+pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/scores/{attribute_slug}", get(get_scores))
         .route("/scores/{attribute_slug}/solve", post(solve_scores))
@@ -33,7 +34,7 @@ struct ScoreParams {
 }
 
 async fn get_scores(
-    State(pool): State<PgPool>,
+    State(state): State<Arc<AppState>>,
     Path(attribute_slug): Path<String>,
     Query(params): Query<ScoreParams>,
 ) -> Result<Json<Vec<ScoreRow>>, ApiError> {
@@ -53,7 +54,7 @@ async fn get_scores(
     .bind(&attribute_slug)
     .bind(limit)
     .bind(offset)
-    .fetch_all(&pool)
+    .fetch_all(&state.db)
     .await?;
 
     let scores: Vec<_> = rows
@@ -72,36 +73,33 @@ async fn get_scores(
     Ok(Json(scores))
 }
 
-/// Solve: run the IRLS solver over all comparisons for this attribute
-/// and write updated scores.
 async fn solve_scores(
-    State(pool): State<PgPool>,
+    State(state): State<Arc<AppState>>,
     Path(attribute_slug): Path<String>,
 ) -> Result<Json<SolveResult>, ApiError> {
-    // Fetch attribute
+    let pool = &state.db;
+
     let attribute_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM attributes WHERE slug = $1",
     )
     .bind(&attribute_slug)
-    .fetch_optional(&pool)
+    .fetch_optional(pool)
     .await?
     .ok_or_else(|| ApiError::NotFound(format!("attribute {attribute_slug}")))?;
 
-    // Fetch all comparisons for this attribute
     let comparisons = sqlx::query_as::<_, (Uuid, Uuid, f64, f64, f64)>(
         "SELECT entity_a_id, entity_b_id, ln_ratio, confidence, repeats
          FROM comparisons
          WHERE attribute_id = $1",
     )
     .bind(attribute_id)
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await?;
 
     if comparisons.is_empty() {
         return Err(ApiError::BadRequest("no comparisons to solve".into()));
     }
 
-    // Build entity index (dense 0..N mapping)
     let mut entity_ids: Vec<Uuid> = Vec::new();
     let mut entity_index = std::collections::HashMap::new();
     for (a, b, _, _, _) in &comparisons {
@@ -118,7 +116,6 @@ async fn solve_scores(
         return Err(ApiError::BadRequest("need at least 2 entities".into()));
     }
 
-    // Build observations for cardinal-harness rating engine
     use cardinal_harness::rating_engine::{
         AttributeParams, Observation, RatingEngine,
     };
@@ -150,7 +147,6 @@ async fn solve_scores(
     engine.add_observations(&observations);
     let summary = engine.solve();
 
-    // Write scores
     let mut tx = pool.begin().await?;
 
     sqlx::query("DELETE FROM scores WHERE attribute_id = $1")

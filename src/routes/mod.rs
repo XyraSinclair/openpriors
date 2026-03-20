@@ -1,23 +1,33 @@
 pub mod attributes;
+pub mod auth;
 pub mod entities;
 pub mod health;
 pub mod judge;
+pub mod pages;
+pub mod rate;
 pub mod scores;
 
 use axum::Router;
-use sqlx::PgPool;
+use std::sync::Arc;
 
-pub fn router(pool: PgPool) -> Router {
+use crate::auth::AppState;
+
+pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(health::routes())
-        .nest("/v1", api_routes(pool))
+        // HTML pages at root level (not under /v1)
+        .merge(pages::routes().with_state(state.clone()))
+        // API routes under /v1
+        .nest("/v1", api_routes(state))
 }
 
-fn api_routes(pool: PgPool) -> Router {
+fn api_routes(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(entities::routes())
         .merge(attributes::routes())
         .merge(judge::routes())
         .merge(scores::routes())
-        .with_state(pool)
+        .merge(rate::routes())
+        .merge(auth::routes())
+        .with_state(state)
 }

@@ -7,11 +7,15 @@ description = "High-throughput structured LLM judgements. Rate any entity by any
 repository = "https://github.com/XyraSinclair/openpriors"
 
 [dependencies]
-axum = { version = "0.8", features = ["json"] }
+argon2 = "0.5"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json", "macros"] }
 # Path dep until cardinal-harness publishes rusqlite as optional on GitHub.
 # Once pushed: cardinal-harness = { git = "https://github.com/XyraSinclair/cardinal-harness", default-features = false }
 cardinal-harness = { path = "../cardinal-harness", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }

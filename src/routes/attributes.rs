@@ -4,12 +4,13 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::auth::AppState;
 use crate::error::ApiError;
 
-pub fn routes() -> Router<PgPool> {
+pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/attributes", post(create_attribute).get(list_attributes))
         .route("/attributes/{slug}", get(get_attribute))
@@ -34,7 +35,7 @@ struct AttributeResponse {
 }
 
 async fn create_attribute(
-    State(pool): State<PgPool>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<CreateAttribute>,
 ) -> Result<Json<AttributeResponse>, ApiError> {
     let display_name = body.name.as_deref().unwrap_or(&body.slug);
@@ -51,7 +52,7 @@ async fn create_attribute(
     .bind(display_name)
     .bind(&body.description)
     .bind(&body.prompt_template)
-    .fetch_one(&pool)
+    .fetch_one(&state.db)
     .await?;
 
     Ok(Json(AttributeResponse {
@@ -66,7 +67,7 @@ struct ListParams {
 }
 
 async fn list_attributes(
-    State(pool): State<PgPool>,
+    State(state): State<Arc<AppState>>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<AttributeResponse>>, ApiError> {
     let limit = params.limit.unwrap_or(100).min(1000);
@@ -78,7 +79,7 @@ async fn list_attributes(
     )
     .bind(limit)
     .bind(offset)
-    .fetch_all(&pool)
+    .fetch_all(&state.db)
     .await?;
 
     let attrs: Vec<_> = rows
@@ -92,14 +93,14 @@ async fn list_attributes(
 }
 
 async fn get_attribute(
-    State(pool): State<PgPool>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path(slug): axum::extract::Path<String>,
 ) -> Result<Json<AttributeResponse>, ApiError> {
     let row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)>(
         "SELECT id, slug, name, description, prompt_template, created_at FROM attributes WHERE slug = $1",
     )
     .bind(&slug)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| ApiError::NotFound(format!("attribute {slug}")))?;
 
