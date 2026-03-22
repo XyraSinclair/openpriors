@@ -23,6 +23,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 fn api_routes(state: Arc<AppState>) -> Router {
     Router::new()
+        .merge(health::api_routes())
         .merge(entities::routes())
         .merge(attributes::routes())
         .merge(judge::routes())
