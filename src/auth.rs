@@ -168,15 +168,13 @@ pub struct MaybeAuth(pub Option<AuthUser>);
 impl FromRequestParts<Arc<AppState>> for MaybeAuth {
     type Rejection = ApiError;
 
-    fn from_request_parts(
+    async fn from_request_parts(
         parts: &mut Parts,
         state: &Arc<AppState>,
-    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
-        async move {
-            match AuthUser::from_request_parts(parts, state).await {
-                Ok(user) => Ok(MaybeAuth(Some(user))),
-                Err(_) => Ok(MaybeAuth(None)),
-            }
+    ) -> Result<Self, Self::Rejection> {
+        match AuthUser::from_request_parts(parts, state).await {
+            Ok(user) => Ok(MaybeAuth(Some(user))),
+            Err(_) => Ok(MaybeAuth(None)),
         }
     }
 }

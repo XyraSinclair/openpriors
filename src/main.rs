@@ -11,6 +11,7 @@ use openpriors::config::Config;
 use openpriors::db;
 use openpriors::routes;
 use tower_http::cors::CorsLayer;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -23,9 +24,20 @@ async fn main() {
     let config = Config::from_env();
     let bind_addr = config.bind_addr.clone();
     let cors_allowed_origins = config.cors_allowed_origins.clone();
-    let pool = db::connect(&config.database_url).await;
+    let pool = db::connect(
+        &config.database_url,
+        config.database_max_connections,
+        config.database_acquire_timeout(),
+    )
+    .await
+    .expect("failed to connect to database");
 
-    tracing::info!("connected to database");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        max_connections = config.database_max_connections,
+        acquire_timeout_secs = config.database_acquire_timeout_secs,
+        "connected to database"
+    );
 
     // Build provider gateway (reads OPENROUTER_API_KEY from env)
     let usage_sink = Arc::new(NoopUsageSink);
@@ -46,6 +58,8 @@ async fn main() {
 
     let app = routes::router(state)
         .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(harden_http));
 
@@ -79,8 +93,35 @@ async fn main() {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
     .expect("server error");
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install CTRL+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    tracing::info!("shutdown signal received");
 }
 
 async fn harden_http(mut req: Request, next: Next) -> Response {

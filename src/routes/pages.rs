@@ -59,7 +59,7 @@ async fn landing() -> Html<String> {
   "attribute": "insightfulness",
   "model": "openai/gpt-5-mini"
 }}</code></pre>
-<p><a href="/v1/health">API health</a></p>
+<p><a href="/v1/healthz">API health</a> · <a href="/v1/readyz">readiness</a></p>
 </section>
 
 <section>

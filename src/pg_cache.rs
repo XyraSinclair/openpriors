@@ -50,7 +50,7 @@ impl PairwiseCache for PgPairwiseCache {
         .bind(&key.attribute_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| CacheError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .map_err(|e| CacheError::Io(std::io::Error::other(e)))?;
 
         match row {
             None => Ok(None),
@@ -95,7 +95,7 @@ impl PairwiseCache for PgPairwiseCache {
 
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, HexError> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err(HexError);
         }
         (0..s.len())

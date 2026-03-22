@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out openpriors
+        uses: actions/checkout@v4
+        with:
+          path: openpriors
+
+      - name: Check out cardinal-harness
+        uses: actions/checkout@v4
+        with:
+          repository: XyraSinclair/cardinal-harness
+          path: cardinal-harness
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            openpriors -> openpriors/target
+
+      - name: Check formatting
+        working-directory: openpriors
+        run: cargo fmt -- --check
+
+      - name: Run tests
+        working-directory: openpriors
+        run: cargo test
+
+      - name: Run clippy
+        working-directory: openpriors
+        run: cargo clippy --all-targets --all-features -- -D warnings

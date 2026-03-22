@@ -1,12 +1,26 @@
+use std::time::Duration;
+
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-pub async fn connect(database_url: &str) -> PgPool {
+pub async fn connect(
+    database_url: &str,
+    max_connections: u32,
+    acquire_timeout: Duration,
+) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout)
+        .test_before_acquire(true)
         .connect(database_url)
         .await
-        .expect("failed to connect to database")
+}
+
+pub async fn ping(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(pool)
+        .await
+        .map(|_| ())
 }
 
 /// Ensure or retrieve an entity by URI, creating it if absent.

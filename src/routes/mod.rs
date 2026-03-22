@@ -14,7 +14,7 @@ use crate::auth::AppState;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .merge(health::routes())
+        .merge(health::routes().with_state(state.clone()))
         // HTML pages at root level (not under /v1)
         .merge(pages::routes().with_state(state.clone()))
         // API routes under /v1

@@ -1,11 +1,13 @@
 use std::env;
 use std::net::IpAddr;
+use std::time::Duration;
 
 pub struct Config {
     pub database_url: String,
+    pub database_max_connections: u32,
+    pub database_acquire_timeout_secs: u64,
     pub bind_addr: String,
     pub default_model: String,
-    pub openrouter_api_key: String,
     pub admin_api_key: Option<String>,
     pub admin_allowed_ips: Vec<IpAddr>,
     pub cors_allowed_origins: Vec<String>,
@@ -18,11 +20,11 @@ impl Config {
     pub fn from_env() -> Self {
         Self {
             database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+            database_max_connections: parse_u32("DATABASE_MAX_CONNECTIONS", 20),
+            database_acquire_timeout_secs: parse_u64("DATABASE_ACQUIRE_TIMEOUT_SECS", 10),
             bind_addr: env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
             default_model: env::var("DEFAULT_MODEL")
                 .unwrap_or_else(|_| "openai/gpt-5-mini".to_string()),
-            openrouter_api_key: env::var("OPENROUTER_API_KEY")
-                .expect("OPENROUTER_API_KEY must be set"),
             admin_api_key: env::var("ADMIN_API_KEY").ok().filter(|s| !s.is_empty()),
             admin_allowed_ips: parse_ip_list("ADMIN_ALLOWED_IPS"),
             cors_allowed_origins: parse_csv("CORS_ALLOWED_ORIGINS"),
@@ -37,6 +39,10 @@ impl Config {
             return ip.is_loopback();
         }
         self.admin_allowed_ips.contains(&ip)
+    }
+
+    pub fn database_acquire_timeout(&self) -> Duration {
+        Duration::from_secs(self.database_acquire_timeout_secs)
     }
 }
 
@@ -53,6 +59,14 @@ fn parse_bool(name: &str, default: bool) -> bool {
 }
 
 fn parse_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_u32(name: &str, default: u32) -> u32 {
     env::var(name)
         .ok()
         .and_then(|value| value.trim().parse().ok())

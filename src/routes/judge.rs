@@ -86,6 +86,13 @@ struct JudgeResponse {
     cost_nanodollars: Option<i64>,
 }
 
+struct ParsedLlmResponse {
+    ln_ratio: Option<f64>,
+    confidence: Option<f64>,
+    status: String,
+    reasoning: Option<String>,
+}
+
 async fn submit_judgement(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
@@ -401,7 +408,12 @@ async fn submit_judgement(
 
         // Parse LLM response
         let raw_output = &chat_resp.content;
-        let (ln_ratio, confidence, status, reasoning) = parse_llm_response(raw_output, flipped)?;
+        let ParsedLlmResponse {
+            ln_ratio,
+            confidence,
+            status,
+            reasoning,
+        } = parse_llm_response(raw_output, flipped)?;
 
         let judgement_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO judgements
@@ -472,10 +484,7 @@ async fn submit_judgement(
 }
 
 /// Parse the LLM JSON response into (ln_ratio, confidence, status, reasoning).
-fn parse_llm_response(
-    raw: &str,
-    flipped: bool,
-) -> Result<(Option<f64>, Option<f64>, String, Option<String>), ApiError> {
+fn parse_llm_response(raw: &str, flipped: bool) -> Result<ParsedLlmResponse, ApiError> {
     let normalized = strip_json_fence(raw);
     let parsed: serde_json::Value = serde_json::from_str(normalized)
         .map_err(|e| ApiError::Internal(format!("failed to parse LLM output: {e}")))?;
@@ -489,7 +498,12 @@ fn parse_llm_response(
             .get("reason")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        return Ok((None, None, "refused".to_string(), reason));
+        return Ok(ParsedLlmResponse {
+            ln_ratio: None,
+            confidence: None,
+            status: "refused".to_string(),
+            reasoning: reason,
+        });
     }
 
     let higher = parsed
@@ -528,12 +542,12 @@ fn parse_llm_response(
         -(ratio.ln())
     };
 
-    Ok((
-        Some(ln_ratio),
+    Ok(ParsedLlmResponse {
+        ln_ratio: Some(ln_ratio),
         confidence,
-        "success".to_string(),
-        None, // reasoning is in the raw output
-    ))
+        status: "success".to_string(),
+        reasoning: None, // reasoning is in the raw output
+    })
 }
 
 fn strip_json_fence(raw: &str) -> &str {
@@ -738,23 +752,21 @@ mod tests {
     #[test]
     fn parse_llm_response_accepts_valid_json() {
         let raw = r#"{"higher_ranked":"A","ratio":2.0,"confidence":0.7}"#;
-        let (ln_ratio, confidence, status, reasoning) =
-            parse_llm_response(raw, false).expect("valid JSON should parse");
+        let parsed = parse_llm_response(raw, false).expect("valid JSON should parse");
 
-        assert_eq!(status, "success");
-        assert_eq!(confidence, Some(0.7));
-        assert!(ln_ratio.expect("ratio should be present") > 0.0);
-        assert!(reasoning.is_none());
+        assert_eq!(parsed.status, "success");
+        assert_eq!(parsed.confidence, Some(0.7));
+        assert!(parsed.ln_ratio.expect("ratio should be present") > 0.0);
+        assert!(parsed.reasoning.is_none());
     }
 
     #[test]
     fn parse_llm_response_accepts_fenced_json() {
         let raw = "```json\n{\"higher_ranked\":\"B\",\"ratio\":2.0,\"confidence\":0.6}\n```";
-        let (ln_ratio, confidence, status, _) =
-            parse_llm_response(raw, false).expect("fenced JSON should parse");
+        let parsed = parse_llm_response(raw, false).expect("fenced JSON should parse");
 
-        assert_eq!(status, "success");
-        assert_eq!(confidence, Some(0.6));
-        assert!(ln_ratio.expect("ratio should be present") < 0.0);
+        assert_eq!(parsed.status, "success");
+        assert_eq!(parsed.confidence, Some(0.6));
+        assert!(parsed.ln_ratio.expect("ratio should be present") < 0.0);
     }
 }

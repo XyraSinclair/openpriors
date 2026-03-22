@@ -18,7 +18,9 @@ and propagate that measurement as far in the ecology as information technology a
 - **Database**: PostgreSQL, `db/schema.sql`
 - **Solver**: [cardinal-harness](https://github.com/XyraSinclair/cardinal-harness) — pairwise ratio → IRLS → cardinal scores with uncertainty
 - **LLM Gateway**: OpenRouter via cardinal-harness `ProviderGateway`
-- **Server**: planned separate host from ExoPriors
+- **Server**: dedicated OpenPriors infrastructure only; the confirmed host is the
+  inference gateway at `204.168.182.12` (`basin-openpriors-cluster-proxy`).
+  See `docs/infrastructure.md`.
 
 ### Core Tables
 
@@ -92,6 +94,11 @@ and propagate that measurement as far in the ecology as information technology a
 **Open source first.** No credentials in the repo. All secrets via `.env`.
 
 **Read before editing.** Inspect the code you're changing.
+
+**Infrastructure boundary.** OpenPriors work stays on OpenPriors-dedicated
+hosts. Do not use or mutate ExoPriors or Pivotality infrastructure from this
+repo. If a new OpenPriors host is introduced, document it in
+`docs/infrastructure.md` before using it.
 
 **cardinal-harness is the algorithmic core.** Don't reinvent the solver, the
 planner, or the prompt templates. Wrap them.

@@ -24,7 +24,7 @@ git clone https://github.com/XyraSinclair/openpriors
 cd openpriors
 
 cp .env.example .env
-# Set DATABASE_URL in .env
+# Set DATABASE_URL and OPENROUTER_API_KEY in .env
 
 createdb openpriors
 psql openpriors < db/schema.sql
@@ -62,12 +62,36 @@ Get the leaderboard:
 curl http://localhost:8080/v1/scores/ergonomics_for_systems_programming
 ```
 
+Check server health:
+
+```bash
+curl -fsS http://localhost:8080/healthz
+curl -fsS http://localhost:8080/readyz
+```
+
 ## Architecture
 
 - **Rust** (axum) API server
 - **PostgreSQL** for all persistence
 - **cardinal-harness** for the IRLS solver and pairwise comparison framework
 - No credentials in the repo. All secrets via `.env`.
+
+## Infrastructure
+
+OpenPriors uses dedicated infrastructure. The confirmed OpenPriors-only host and
+access pattern are documented in [docs/infrastructure.md](docs/infrastructure.md).
+Do not use ExoPriors or Pivotality hosts for OpenPriors work.
+
+## Health
+
+The repo health bar and operational checks live in [docs/health.md](docs/health.md).
+The short version:
+
+- `cargo fmt -- --check`
+- `cargo test`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `curl -fsS http://localhost:8080/healthz`
+- `curl -fsS http://localhost:8080/readyz`
 
 See [AGENTS.md](AGENTS.md) for the full technical reference.
 
