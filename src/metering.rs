@@ -21,11 +21,7 @@ pub struct MeteringGateway {
 }
 
 impl MeteringGateway {
-    pub fn new(
-        inner: Arc<dyn ChatGateway>,
-        pool: PgPool,
-        user_id: Uuid,
-    ) -> Self {
+    pub fn new(inner: Arc<dyn ChatGateway>, pool: PgPool, user_id: Uuid) -> Self {
         Self {
             inner,
             pool,
@@ -49,6 +45,17 @@ impl MeteringGateway {
 #[async_trait]
 impl ChatGateway for MeteringGateway {
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let balance = crate::credits::get_balance(&self.pool, self.user_id)
+            .await
+            .map_err(|e| ProviderError::provider("metering", e.to_string(), false))?;
+        if balance <= 0 {
+            return Err(ProviderError::provider(
+                "metering",
+                "insufficient credits",
+                false,
+            ));
+        }
+
         let resp = self.inner.chat(req).await?;
 
         let marked_up_cost = self.apply_markup(resp.cost_nanodollars);
@@ -56,14 +63,14 @@ impl ChatGateway for MeteringGateway {
         if marked_up_cost > 0 {
             let call_num = self.call_counter.fetch_add(1, Ordering::Relaxed);
             let idempotency_key = format!("llm:{}:{}", self.session_id, call_num);
+            let related_object = format!("llm_session:{}:{}", self.session_id, call_num);
 
-            // Best-effort credit burn — log but don't fail the LLM call
             if let Err(e) = crate::credits::burn_credits(
                 &self.pool,
                 self.user_id,
                 marked_up_cost,
                 &idempotency_key,
-                None,
+                Some(&related_object),
                 Some("llm call"),
             )
             .await
@@ -73,6 +80,11 @@ impl ChatGateway for MeteringGateway {
                     cost = marked_up_cost,
                     "failed to burn credits: {e}"
                 );
+                return Err(ProviderError::provider(
+                    "metering",
+                    format!("credit settlement failed: {e}"),
+                    false,
+                ));
             }
         }
 

@@ -1,5 +1,16 @@
 /target
 /.env
+.env.local
+.env.*.local
+*.dump
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
 *.swp
 *.swo
 *~

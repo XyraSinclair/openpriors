@@ -17,6 +17,7 @@ CREATE TABLE users (
     email           citext NOT NULL UNIQUE,
     password_hash   TEXT NOT NULL,          -- argon2id
     account_state   TEXT NOT NULL DEFAULT 'active' CHECK (account_state IN ('active', 'suspended', 'deleted')),
+    role            TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -110,6 +111,7 @@ CREATE TABLE judgements (
     ln_ratio        DOUBLE PRECISION,       -- ln(score_a / score_b), NULL if refused/error
     confidence      DOUBLE PRECISION DEFAULT 0.5 CHECK (confidence IS NULL OR confidence BETWEEN 0.0 AND 1.0),
     status          TEXT NOT NULL DEFAULT 'success' CHECK (status IN ('success', 'refused', 'error', 'abstain')),
+    cache_eligible  BOOLEAN NOT NULL DEFAULT FALSE, -- only trusted server-side LLM rows may satisfy cache hits
 
     -- Provenance
     prompt_hash     BYTEA NOT NULL,         -- blake3(prompt_text) for dedup/cache-hit
@@ -137,6 +139,10 @@ CREATE INDEX idx_judgements_entity_b ON judgements (entity_b_id, created_at DESC
 CREATE UNIQUE INDEX idx_judgements_idempotency ON judgements (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 -- Cache dedup: exact match on the four-tuple
 CREATE INDEX idx_judgements_cache_lookup ON judgements (prompt_hash, entity_a_id, entity_b_id, attribute_id);
+-- Trusted cache lookup only
+CREATE INDEX idx_judgements_cache_lookup_trusted
+    ON judgements (prompt_hash, entity_a_id, entity_b_id, attribute_id, rater_id)
+    WHERE cache_eligible = TRUE;
 
 -------------------------------------------------------------------------------
 -- Comparisons: aggregated pairwise measurements
@@ -229,7 +235,7 @@ CREATE UNIQUE INDEX idx_credit_events_idempotency ON credit_events (user_id, ide
 
 -- Advisory lock helper keyed on user UUID to serialize credit mutations
 CREATE OR REPLACE FUNCTION credit_lock_key(uid UUID) RETURNS BIGINT AS $$
-    SELECT ('x' || substr(uid::text, 1, 16))::bit(64)::bigint;
+    SELECT ('x' || substr(replace(uid::text, '-', ''), 1, 16))::bit(64)::bigint;
 $$ LANGUAGE sql IMMUTABLE;
 
 -- Trigger: prevent negative balance

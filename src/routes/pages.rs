@@ -8,7 +8,7 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::auth::AppState;
+use crate::auth::{AppState, MaybeAuth};
 use crate::error::ApiError;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -88,7 +88,18 @@ async fn scores_page(
 
     let (attribute_id, slug, attr_name, attr_desc) = attr;
 
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, f64, Option<f64>, i32, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<String>,
+            f64,
+            Option<f64>,
+            i32,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
         "SELECT s.entity_id, e.uri, e.name, s.score, s.uncertainty,
                 s.comparison_count, s.solved_at
          FROM scores s
@@ -101,12 +112,11 @@ async fn scores_page(
     .fetch_all(&state.db)
     .await?;
 
-    let total_comparisons: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM comparisons WHERE attribute_id = $1",
-    )
-    .bind(attribute_id)
-    .fetch_one(&state.db)
-    .await?;
+    let total_comparisons: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM comparisons WHERE attribute_id = $1")
+            .bind(attribute_id)
+            .fetch_one(&state.db)
+            .await?;
 
     // Normalize scores to 0-100 for display
     let (min_score, max_score) = if rows.is_empty() {
@@ -126,13 +136,7 @@ async fn scores_page(
     let top3: Vec<String> = rows
         .iter()
         .take(3)
-        .map(|r| {
-            r.2.as_deref()
-                .unwrap_or(&r.1)
-                .chars()
-                .take(40)
-                .collect()
-        })
+        .map(|r| r.2.as_deref().unwrap_or(&r.1).chars().take(40).collect())
         .collect();
     let og_desc = if top3.is_empty() {
         format!("Scores for {attr_name}")
@@ -219,28 +223,40 @@ async fn scores_page(
         total_cmp = total_comparisons,
     );
 
-    Ok((
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html,
-    ))
+    Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html))
 }
 
 // --- Judgement Detail ---
 
 async fn judgement_page(
     State(state): State<Arc<AppState>>,
+    auth: MaybeAuth,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let row = sqlx::query_as::<_, (
-        Uuid, Uuid, Uuid, Uuid, Uuid,
-        Option<f64>, f64, String,
-        Option<String>, String, String,
-        Option<i32>, Option<i32>, Option<i64>, Option<i32>,
-        chrono::DateTime<chrono::Utc>,
-    )>(
-        "SELECT j.id, j.entity_a_id, j.entity_b_id, j.attribute_id, j.rater_id,
+    let row = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            Uuid,
+            Uuid,
+            Uuid,
+            Option<Uuid>,
+            Option<f64>,
+            Option<f64>,
+            String,
+            Option<String>,
+            String,
+            Option<i32>,
+            Option<i32>,
+            Option<i64>,
+            Option<i32>,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        "SELECT j.id, j.entity_a_id, j.entity_b_id, j.attribute_id, j.rater_id, j.user_id,
                 j.ln_ratio, j.confidence, j.status,
-                j.reasoning_text, j.prompt_text, j.raw_output,
+                j.reasoning_text, j.raw_output,
                 j.input_tokens, j.output_tokens, j.cost_nanodollars, j.latency_ms,
                 j.created_at
          FROM judgements j WHERE j.id = $1",
@@ -249,6 +265,18 @@ async fn judgement_page(
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| ApiError::NotFound(format!("judgement {id}")))?;
+
+    if !state.config.public_judgements {
+        let auth_user = auth
+            .0
+            .ok_or_else(|| ApiError::Unauthorized("authentication required".into()))?;
+
+        if row.5 != Some(auth_user.user_id) {
+            return Err(ApiError::Forbidden(
+                "not allowed to view this judgement".into(),
+            ));
+        }
+    }
 
     // Get entity and attribute names
     let entity_a = sqlx::query_as::<_, (String, Option<String>)>(
@@ -265,31 +293,47 @@ async fn judgement_page(
     .fetch_one(&state.db)
     .await?;
 
-    let attr = sqlx::query_as::<_, (String, String)>(
-        "SELECT slug, name FROM attributes WHERE id = $1",
-    )
-    .bind(row.3)
-    .fetch_one(&state.db)
-    .await?;
+    let attr =
+        sqlx::query_as::<_, (String, String)>("SELECT slug, name FROM attributes WHERE id = $1")
+            .bind(row.3)
+            .fetch_one(&state.db)
+            .await?;
 
-    let rater_name = sqlx::query_scalar::<_, String>(
-        "SELECT name FROM raters WHERE id = $1",
-    )
-    .bind(row.4)
-    .fetch_one(&state.db)
-    .await?;
+    let rater_name = sqlx::query_scalar::<_, String>("SELECT name FROM raters WHERE id = $1")
+        .bind(row.4)
+        .fetch_one(&state.db)
+        .await?;
 
     let entity_a_name = entity_a.1.as_deref().unwrap_or(&entity_a.0);
     let entity_b_name = entity_b.1.as_deref().unwrap_or(&entity_b.0);
 
-    let ratio_display = match row.5 {
-        Some(lr) if lr >= 0.0 => format!("{} is {:.1}× more {} than {}", entity_a_name, lr.exp(), attr.1, entity_b_name),
-        Some(lr) => format!("{} is {:.1}× more {} than {}", entity_b_name, (-lr).exp(), attr.1, entity_a_name),
+    let ratio_display = match row.6 {
+        Some(lr) if lr >= 0.0 => format!(
+            "{} is {:.1}× more {} than {}",
+            entity_a_name,
+            lr.exp(),
+            attr.1,
+            entity_b_name
+        ),
+        Some(lr) => format!(
+            "{} is {:.1}× more {} than {}",
+            entity_b_name,
+            (-lr).exp(),
+            attr.1,
+            entity_a_name
+        ),
         None => "No ratio (refused/error)".to_string(),
     };
 
-    let reasoning = row.8.as_deref().unwrap_or("(no reasoning trace)");
-    let cost = row.13.map(|c| format!("${:.6}", c as f64 / 1e9)).unwrap_or_else(|| "-".to_string());
+    let reasoning = row.9.as_deref().unwrap_or("(no reasoning trace)");
+    let cost = row
+        .13
+        .map(|c| format!("${:.6}", c as f64 / 1e9))
+        .unwrap_or_else(|| "-".to_string());
+    let confidence_display = row
+        .7
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_string());
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -308,7 +352,7 @@ async fn judgement_page(
 <h2>{ratio_display}</h2>
 <table class="detail-table">
 <tr><td>Status</td><td>{status}</td></tr>
-<tr><td>Confidence</td><td>{confidence:.2}</td></tr>
+<tr><td>Confidence</td><td>{confidence_display}</td></tr>
 <tr><td>Entity A</td><td>{entity_a_name_escaped}</td></tr>
 <tr><td>Entity B</td><td>{entity_b_name_escaped}</td></tr>
 <tr><td>Attribute</td><td>{attr_name}</td></tr>
@@ -330,22 +374,34 @@ async fn judgement_page(
 </html>"#,
         attr_slug = html_escape(&attr.0),
         ratio_display = html_escape(&ratio_display),
-        status = html_escape(&row.7),
-        confidence = row.6,
+        status = html_escape(&row.8),
+        confidence_display = confidence_display,
         entity_a_name_escaped = html_escape(entity_a_name),
         entity_b_name_escaped = html_escape(entity_b_name),
         attr_name = html_escape(&attr.1),
         rater = html_escape(&rater_name),
-        in_tok = row.11.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-        out_tok = row.12.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-        latency_ms = row.14.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+        in_tok = row
+            .11
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        out_tok = row
+            .12
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        latency_ms = row
+            .14
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string()),
         created = row.15.format("%Y-%m-%d %H:%M:%S UTC"),
         reasoning_escaped = html_escape(reasoning),
         raw_escaped = html_escape(&row.10),
     );
 
     Ok((
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         html,
     ))
 }

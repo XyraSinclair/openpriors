@@ -1,9 +1,6 @@
-use axum::{
-    extract::State,
-    routing::post,
-    Json, Router,
-};
+use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -90,6 +87,8 @@ async fn rate(
     auth: AuthUser,
     Json(body): Json<RateRequest>,
 ) -> Result<Json<RateResponse>, ApiError> {
+    auth.require_scope("rate:run")?;
+
     let pool = &state.db;
 
     if body.entities.len() < 2 {
@@ -97,6 +96,14 @@ async fn rate(
     }
     if body.entities.len() > 5000 {
         return Err(ApiError::BadRequest("max 5000 entities".into()));
+    }
+    if matches!(body.top_k, Some(0)) {
+        return Err(ApiError::BadRequest("top_k must be at least 1".into()));
+    }
+    if matches!(body.comparison_budget, Some(0)) {
+        return Err(ApiError::BadRequest(
+            "comparison_budget must be at least 1".into(),
+        ));
     }
 
     // Resolve attribute
@@ -113,17 +120,47 @@ async fn rate(
 
     // Resolve entities and get their text
     let mut entity_ids: Vec<Uuid> = Vec::with_capacity(body.entities.len());
-    let mut entity_texts: Vec<(String, String, Option<String>)> = Vec::with_capacity(body.entities.len());
+    let mut entity_texts: Vec<(String, String, Option<String>)> =
+        Vec::with_capacity(body.entities.len());
+    let mut seen_uris = HashSet::with_capacity(body.entities.len());
 
     for input in &body.entities {
         let (name, kind, text_override) = match input {
             EntityInput::Uri(_) => (None, None, None),
-            EntityInput::Full { name, kind, text, .. } => {
-                (name.as_deref(), kind.as_deref(), text.clone())
-            }
+            EntityInput::Full {
+                name, kind, text, ..
+            } => (name.as_deref(), kind.as_deref(), text.clone()),
         };
 
-        let entity_id = crate::db::ensure_entity(pool, input.uri(), name, kind).await?;
+        let uri = input.uri().trim();
+        if uri.is_empty() {
+            return Err(ApiError::BadRequest("entity URI is required".into()));
+        }
+        if uri.len() > 2048 {
+            return Err(ApiError::BadRequest("entity URI is too long".into()));
+        }
+        if !seen_uris.insert(uri.to_string()) {
+            return Err(ApiError::BadRequest(format!("duplicate entity URI {uri}")));
+        }
+        if let Some(name) = name {
+            if name.len() > 256 {
+                return Err(ApiError::BadRequest("entity name is too long".into()));
+            }
+        }
+        if let Some(kind) = kind {
+            if kind.len() > 64 {
+                return Err(ApiError::BadRequest("entity kind is too long".into()));
+            }
+        }
+        if let Some(text) = text_override.as_deref() {
+            if text.len() > 64 * 1024 {
+                return Err(ApiError::BadRequest(
+                    "entity text override is too large".into(),
+                ));
+            }
+        }
+
+        let entity_id = crate::db::ensure_entity(pool, uri, name, kind).await?;
         entity_ids.push(entity_id);
 
         // Get text for this entity
@@ -133,14 +170,13 @@ async fn rate(
             get_entity_text(pool, entity_id).await?
         };
 
-        let entity_name = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT name FROM entities WHERE id = $1",
-        )
-        .bind(entity_id)
-        .fetch_one(pool)
-        .await?;
+        let entity_name =
+            sqlx::query_scalar::<_, Option<String>>("SELECT name FROM entities WHERE id = $1")
+                .bind(entity_id)
+                .fetch_one(pool)
+                .await?;
 
-        entity_texts.push((input.uri().to_string(), text, entity_name));
+        entity_texts.push((uri.to_string(), text, entity_name));
     }
 
     // Build MultiRerankRequest
@@ -203,8 +239,7 @@ async fn rate(
 
     let pg_cache = PgPairwiseCache::new(state.db.clone());
 
-    let attribution = Attribution::new("openpriors::rate")
-        .with_user(auth.user_id);
+    let attribution = Attribution::new("openpriors::rate").with_user(auth.user_id);
 
     // Run the reranker
     let result = multi_rerank_with_trace(
@@ -233,7 +268,9 @@ async fn rate(
     // Build ranked list from rerank results
     let mut ranked: Vec<_> = result.entities.iter().collect();
     ranked.sort_by(|a, b| {
-        b.u_mean.partial_cmp(&a.u_mean).unwrap_or(std::cmp::Ordering::Equal)
+        b.u_mean
+            .partial_cmp(&a.u_mean)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     for (rank_idx, entity_result) in ranked.iter().enumerate() {

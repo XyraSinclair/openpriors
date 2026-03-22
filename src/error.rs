@@ -16,6 +16,9 @@ pub enum ApiError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -30,13 +33,20 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
+            ApiError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             ApiError::Db(e) => {
                 tracing::error!("database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             ApiError::Internal(msg) => {
                 tracing::error!("internal error: {msg}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         let body = axum::Json(json!({ "error": message }));

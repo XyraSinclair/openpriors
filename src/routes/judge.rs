@@ -10,7 +10,7 @@ use uuid::Uuid;
 use cardinal_harness::gateway::{Attribution, ChatModel, ChatRequest, Message};
 use cardinal_harness::ChatGateway;
 
-use crate::auth::{AppState, MaybeAuth};
+use crate::auth::{AppState, AuthUser, MaybeAuth};
 use crate::db;
 use crate::error::ApiError;
 
@@ -88,20 +88,26 @@ struct JudgeResponse {
 
 async fn submit_judgement(
     State(state): State<Arc<AppState>>,
-    auth: MaybeAuth,
+    auth: AuthUser,
     Json(body): Json<JudgeRequest>,
 ) -> Result<Json<JudgeResponse>, ApiError> {
+    auth.require_scope("judge:write")?;
+
     let pool = &state.db;
 
     // Resolve entities first (need UUIDs for canonical ordering)
-    let a_uri = body.entity_a.uri();
-    let b_uri = body.entity_b.uri();
+    let a_uri = validate_entity_ref(&body.entity_a)?;
+    let b_uri = validate_entity_ref(&body.entity_b)?;
     if a_uri == b_uri {
-        return Err(ApiError::BadRequest("entity_a and entity_b must differ".into()));
+        return Err(ApiError::BadRequest(
+            "entity_a and entity_b must differ".into(),
+        ));
     }
 
-    let raw_a_id = db::ensure_entity(pool, a_uri, body.entity_a.name(), body.entity_a.kind()).await?;
-    let raw_b_id = db::ensure_entity(pool, b_uri, body.entity_b.name(), body.entity_b.kind()).await?;
+    let raw_a_id =
+        db::ensure_entity(pool, a_uri, body.entity_a.name(), body.entity_a.kind()).await?;
+    let raw_b_id =
+        db::ensure_entity(pool, b_uri, body.entity_b.name(), body.entity_b.kind()).await?;
 
     // Phase 0a fix: canonical order by UUID, not URI
     let (entity_a_id, entity_b_id, flipped) = if raw_a_id < raw_b_id {
@@ -111,40 +117,74 @@ async fn submit_judgement(
     };
 
     // Resolve attribute
-    let attribute_id = db::ensure_attribute(
-        pool,
-        &body.attribute,
-        None,
-        body.attribute_description.as_deref(),
-    )
-    .await?;
-
-    // Resolve rater
-    let model_name = body.model.as_deref().unwrap_or("manual");
-    let rater_kind = if model_name == "manual" { "human" } else { "model" };
-    let provider = detect_provider(model_name);
-    let rater_id = db::ensure_rater(pool, rater_kind, model_name, provider).await?;
+    let attribute_slug = body.attribute.trim();
+    if !is_valid_attribute_slug(attribute_slug) {
+        return Err(ApiError::BadRequest(
+            "attribute slug must use lowercase letters, numbers, '-' or '_'".into(),
+        ));
+    }
+    if attribute_slug.len() > 128 {
+        return Err(ApiError::BadRequest("attribute slug is too long".into()));
+    }
+    if let Some(description) = body.attribute_description.as_deref() {
+        if description.len() > 8192 {
+            return Err(ApiError::BadRequest(
+                "attribute description is too long".into(),
+            ));
+        }
+    }
+    let attribute_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM attributes WHERE slug = $1")
+        .bind(attribute_slug)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("attribute {attribute_slug}")))?;
 
     if let Some(pre_ln_ratio) = body.ln_ratio {
         // Pre-computed judgement path
+        if !pre_ln_ratio.is_finite() {
+            return Err(ApiError::BadRequest("ln_ratio must be finite".into()));
+        }
+
         let ln_ratio = if flipped { -pre_ln_ratio } else { pre_ln_ratio };
-        let confidence = body.confidence.unwrap_or(0.5);
+        let confidence = validate_confidence(body.confidence.unwrap_or(0.5))?;
+
+        let model_name = body.model.as_deref().unwrap_or("manual");
+        validate_model_name(model_name)?;
+        let rater_kind = if model_name == "manual" {
+            "human"
+        } else {
+            "model"
+        };
+        let provider = detect_provider(model_name);
+        let rater_id = db::ensure_rater(pool, rater_kind, model_name, provider).await?;
 
         let prompt_text = body.prompt_text.as_deref().unwrap_or("");
+        if prompt_text.len() > 32 * 1024 {
+            return Err(ApiError::BadRequest("prompt_text is too large".into()));
+        }
         let prompt_hash = blake3::hash(prompt_text.as_bytes());
         let raw_output = body.raw_output.as_deref().unwrap_or("");
+        if raw_output.len() > 128 * 1024 {
+            return Err(ApiError::BadRequest("raw_output is too large".into()));
+        }
+        if let Some(reasoning_text) = body.reasoning_text.as_deref() {
+            if reasoning_text.len() > 128 * 1024 {
+                return Err(ApiError::BadRequest("reasoning_text is too large".into()));
+            }
+        }
 
-        // Phase 0b fix: check cache before inserting
+        // Dedup identical pre-computed judgements for the same rater.
         let cached = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM judgements
              WHERE prompt_hash = $1 AND entity_a_id = $2 AND entity_b_id = $3 AND attribute_id = $4
-             AND status = 'success'
+             AND rater_id = $5 AND status = 'success'
              LIMIT 1",
         )
         .bind(prompt_hash.as_bytes().as_slice())
         .bind(entity_a_id)
         .bind(entity_b_id)
         .bind(attribute_id)
+        .bind(rater_id)
         .fetch_optional(pool)
         .await?;
 
@@ -157,9 +197,14 @@ async fn submit_judgement(
             .fetch_one(pool)
             .await?;
 
-            // Find or create comparison
-            let comparison_id = db::upsert_comparison(
-                pool, entity_a_id, entity_b_id, attribute_id, row.2, row.0, row.1,
+            let comparison_id = db::ensure_comparison(
+                pool,
+                entity_a_id,
+                entity_b_id,
+                attribute_id,
+                row.2,
+                row.0,
+                row.1,
             )
             .await?;
 
@@ -180,16 +225,17 @@ async fn submit_judgement(
 
         let judgement_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO judgements
-               (entity_a_id, entity_b_id, attribute_id, rater_id,
+               (entity_a_id, entity_b_id, attribute_id, rater_id, user_id,
                 prompt_text, reasoning_text, raw_output,
-                ln_ratio, confidence, prompt_hash, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'success')
+                ln_ratio, confidence, prompt_hash, status, cache_eligible)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'success', FALSE)
              RETURNING id",
         )
         .bind(entity_a_id)
         .bind(entity_b_id)
         .bind(attribute_id)
         .bind(rater_id)
+        .bind(auth.user_id)
         .bind(prompt_text)
         .bind(body.reasoning_text.as_deref())
         .bind(raw_output)
@@ -200,7 +246,13 @@ async fn submit_judgement(
         .await?;
 
         let comparison_id = db::upsert_comparison(
-            pool, entity_a_id, entity_b_id, attribute_id, rater_id, ln_ratio, confidence,
+            pool,
+            entity_a_id,
+            entity_b_id,
+            attribute_id,
+            rater_id,
+            ln_ratio,
+            confidence,
         )
         .await?;
 
@@ -218,12 +270,15 @@ async fn submit_judgement(
             cost_nanodollars: None,
         }))
     } else {
-        // Server-side LLM dispatch — requires auth
-        let auth_user = auth.0.ok_or_else(|| {
-            ApiError::Unauthorized(
-                "authentication required for server-side LLM calls".into(),
-            )
-        })?;
+        let model_id = body.model.as_deref().unwrap_or(&state.config.default_model);
+        validate_model_name(model_id)?;
+        let provider = detect_provider(model_id);
+        let rater_id = db::ensure_rater(pool, "model", model_id, provider).await?;
+
+        let balance = crate::credits::get_balance(pool, auth.user_id).await?;
+        if balance <= 0 {
+            return Err(ApiError::Forbidden("insufficient credits".into()));
+        }
 
         // Get entity text
         let entity_a_text = get_entity_text(pool, entity_a_id).await?;
@@ -256,9 +311,8 @@ async fn submit_judgement(
              Output only valid JSON, no other text."
         );
 
-        let user_prompt = format!(
-            "<entity_A>\n{a_label}\n</entity_A>\n\n<entity_B>\n{b_label}\n</entity_B>"
-        );
+        let user_prompt =
+            format!("<entity_A>\n{a_label}\n</entity_A>\n\n<entity_B>\n{b_label}\n</entity_B>");
 
         let prompt_text = format!("{system_prompt}\n---\n{user_prompt}");
         let prompt_hash = blake3::hash(prompt_text.as_bytes());
@@ -267,6 +321,7 @@ async fn submit_judgement(
         let cached = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM judgements
              WHERE prompt_hash = $1 AND entity_a_id = $2 AND entity_b_id = $3 AND attribute_id = $4
+             AND rater_id = $5 AND cache_eligible = TRUE
              AND status IN ('success', 'refused')
              LIMIT 1",
         )
@@ -274,11 +329,12 @@ async fn submit_judgement(
         .bind(entity_a_id)
         .bind(entity_b_id)
         .bind(attribute_id)
+        .bind(rater_id)
         .fetch_optional(pool)
         .await?;
 
         if let Some(existing_id) = cached {
-            let row = sqlx::query_as::<_, (Option<f64>, f64, Uuid, Option<String>, String)>(
+            let row = sqlx::query_as::<_, (Option<f64>, Option<f64>, Uuid, Option<String>, String)>(
                 "SELECT ln_ratio, confidence, rater_id, reasoning_text, status FROM judgements WHERE id = $1",
             )
             .bind(existing_id)
@@ -286,12 +342,20 @@ async fn submit_judgement(
             .await?;
 
             if row.4 == "refused" {
-                return Err(ApiError::BadRequest("LLM refused to judge this comparison".into()));
+                return Err(ApiError::BadRequest(
+                    "LLM refused to judge this comparison".into(),
+                ));
             }
 
             let ln_ratio = row.0.unwrap_or(0.0);
-            let comparison_id = db::upsert_comparison(
-                pool, entity_a_id, entity_b_id, attribute_id, row.2, ln_ratio, row.1,
+            let comparison_id = db::ensure_comparison(
+                pool,
+                entity_a_id,
+                entity_b_id,
+                attribute_id,
+                row.2,
+                ln_ratio,
+                row.1.unwrap_or(0.5),
             )
             .await?;
 
@@ -303,32 +367,25 @@ async fn submit_judgement(
                 attribute_id,
                 rater_id: row.2,
                 ln_ratio,
-                confidence: row.1,
+                confidence: row.1.unwrap_or(0.5),
                 cached: true,
                 reasoning_text: row.3,
                 cost_nanodollars: None,
             }));
         }
 
-        // Call LLM
-        let model_id = body.model.as_deref().unwrap_or(&state.config.default_model);
-
         // Create metering gateway for this user
         let metering = crate::metering::MeteringGateway::new(
             state.gateway.clone(),
             state.db.clone(),
-            auth_user.user_id,
+            auth.user_id,
         );
 
-        let attribution = Attribution::new("openpriors::judge")
-            .with_user(auth_user.user_id);
+        let attribution = Attribution::new("openpriors::judge").with_user(auth.user_id);
 
         let chat_req = ChatRequest::new(
             ChatModel::openrouter(model_id),
-            vec![
-                Message::system(system_prompt),
-                Message::user(user_prompt),
-            ],
+            vec![Message::system(system_prompt), Message::user(user_prompt)],
             attribution,
         )
         .temperature(0.0)
@@ -336,33 +393,31 @@ async fn submit_judgement(
         .json();
 
         let start = std::time::Instant::now();
-        let chat_resp = metering.chat(chat_req).await.map_err(|e| {
-            ApiError::Internal(format!("LLM call failed: {e}"))
-        })?;
+        let chat_resp = metering
+            .chat(chat_req)
+            .await
+            .map_err(|e| ApiError::Internal(format!("LLM call failed: {e}")))?;
         let latency_ms = start.elapsed().as_millis() as i32;
 
         // Parse LLM response
         let raw_output = &chat_resp.content;
         let (ln_ratio, confidence, status, reasoning) = parse_llm_response(raw_output, flipped)?;
 
-        // Resolve rater for the actual model used
-        let rater_id = db::ensure_rater(pool, "model", model_id, Some("openrouter")).await?;
-
         let judgement_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO judgements
                (entity_a_id, entity_b_id, attribute_id, rater_id, user_id,
                 prompt_text, reasoning_text, raw_output,
                 entity_a_text, entity_b_text, question_text,
-                ln_ratio, confidence, prompt_hash, status,
+                ln_ratio, confidence, prompt_hash, status, cache_eligible,
                 input_tokens, output_tokens, cost_nanodollars, latency_ms)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE, $16, $17, $18, $19)
              RETURNING id",
         )
         .bind(entity_a_id)
         .bind(entity_b_id)
         .bind(attribute_id)
         .bind(rater_id)
-        .bind(auth_user.user_id)
+        .bind(auth.user_id)
         .bind(&prompt_text)
         .bind(&reasoning)
         .bind(raw_output)
@@ -381,14 +436,22 @@ async fn submit_judgement(
         .await?;
 
         if status == "refused" {
-            return Err(ApiError::BadRequest("LLM refused to judge this comparison".into()));
+            return Err(ApiError::BadRequest(
+                "LLM refused to judge this comparison".into(),
+            ));
         }
 
         let ln_ratio = ln_ratio.unwrap_or(0.0);
         let confidence = confidence.unwrap_or(0.5);
 
         let comparison_id = db::upsert_comparison(
-            pool, entity_a_id, entity_b_id, attribute_id, rater_id, ln_ratio, confidence,
+            pool,
+            entity_a_id,
+            entity_b_id,
+            attribute_id,
+            rater_id,
+            ln_ratio,
+            confidence,
         )
         .await?;
 
@@ -413,30 +476,50 @@ fn parse_llm_response(
     raw: &str,
     flipped: bool,
 ) -> Result<(Option<f64>, Option<f64>, String, Option<String>), ApiError> {
-    let parsed: serde_json::Value = serde_json::from_str(raw.trim())
+    let normalized = strip_json_fence(raw);
+    let parsed: serde_json::Value = serde_json::from_str(normalized)
         .map_err(|e| ApiError::Internal(format!("failed to parse LLM output: {e}")))?;
 
-    if parsed.get("refused").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let reason = parsed.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if parsed
+        .get("refused")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let reason = parsed
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         return Ok((None, None, "refused".to_string(), reason));
     }
 
-    let higher = parsed.get("higher_ranked")
+    let higher = parsed
+        .get("higher_ranked")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::Internal("missing higher_ranked in LLM output".into()))?;
 
-    let ratio = parsed.get("ratio")
+    let ratio = parsed
+        .get("ratio")
         .and_then(|v| v.as_f64())
         .ok_or_else(|| ApiError::Internal("missing ratio in LLM output".into()))?;
+    if !ratio.is_finite() || ratio < 1.0 {
+        return Err(ApiError::Internal("invalid ratio in LLM output".into()));
+    }
 
-    let confidence = parsed.get("confidence")
-        .and_then(|v| v.as_f64());
+    let confidence = parsed
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .map(validate_confidence)
+        .transpose()?;
 
     // Convert to ln_ratio in canonical (a < b) order
     let a_is_higher = match higher {
         "A" => !flipped,
         "B" => flipped,
-        _ => return Err(ApiError::Internal(format!("invalid higher_ranked: {higher}"))),
+        _ => {
+            return Err(ApiError::Internal(format!(
+                "invalid higher_ranked: {higher}"
+            )))
+        }
     };
 
     let ln_ratio = if a_is_higher {
@@ -451,6 +534,17 @@ fn parse_llm_response(
         "success".to_string(),
         None, // reasoning is in the raw output
     ))
+}
+
+fn strip_json_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+
+    unfenced.strip_suffix("```").unwrap_or(unfenced).trim()
 }
 
 async fn get_entity_text(pool: &sqlx::PgPool, entity_id: Uuid) -> Result<String, ApiError> {
@@ -489,11 +583,62 @@ fn detect_provider(model_name: &str) -> Option<&'static str> {
         Some("openrouter")
     } else if model_name.starts_with("claude") {
         Some("anthropic")
-    } else if model_name.starts_with("gpt") || model_name.starts_with("o1") || model_name.starts_with("o3") || model_name.starts_with("o4") {
+    } else if model_name.starts_with("gpt")
+        || model_name.starts_with("o1")
+        || model_name.starts_with("o3")
+        || model_name.starts_with("o4")
+    {
         Some("openai")
     } else {
         None
     }
+}
+
+fn validate_entity_ref(entity: &EntityRef) -> Result<&str, ApiError> {
+    let uri = entity.uri().trim();
+    if uri.is_empty() {
+        return Err(ApiError::BadRequest("entity URI is required".into()));
+    }
+    if uri.len() > 2048 {
+        return Err(ApiError::BadRequest("entity URI is too long".into()));
+    }
+    if let Some(name) = entity.name() {
+        if name.len() > 256 {
+            return Err(ApiError::BadRequest("entity name is too long".into()));
+        }
+    }
+    if let Some(kind) = entity.kind() {
+        if kind.len() > 64 {
+            return Err(ApiError::BadRequest("entity kind is too long".into()));
+        }
+    }
+    Ok(uri)
+}
+
+fn validate_confidence(confidence: f64) -> Result<f64, ApiError> {
+    if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+        return Err(ApiError::BadRequest(
+            "confidence must be between 0.0 and 1.0".into(),
+        ));
+    }
+    Ok(confidence)
+}
+
+fn validate_model_name(model_name: &str) -> Result<(), ApiError> {
+    if model_name.trim().is_empty() {
+        return Err(ApiError::BadRequest("model is required".into()));
+    }
+    if model_name.len() > 128 {
+        return Err(ApiError::BadRequest("model name is too long".into()));
+    }
+    Ok(())
+}
+
+fn is_valid_attribute_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
 }
 
 // --- List judgements ---
@@ -506,7 +651,7 @@ struct JudgementRow {
     attribute_id: Uuid,
     rater_id: Uuid,
     ln_ratio: Option<f64>,
-    confidence: f64,
+    confidence: Option<f64>,
     status: String,
     reasoning_text: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -514,19 +659,43 @@ struct JudgementRow {
 
 async fn list_judgements(
     State(state): State<Arc<AppState>>,
+    auth: MaybeAuth,
     axum::extract::Query(params): axum::extract::Query<ListJudgementsParams>,
 ) -> Result<Json<Vec<JudgementRow>>, ApiError> {
-    let limit = params.limit.unwrap_or(100).min(1000);
+    if !state.config.public_judgements && auth.0.is_none() {
+        return Err(ApiError::Unauthorized("authentication required".into()));
+    }
 
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Uuid, Uuid, Option<f64>, f64, String, Option<String>, chrono::DateTime<chrono::Utc>)>(
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    let include_reasoning = state.config.public_judgements || auth.0.is_some();
+    let auth_user_id = auth.0.as_ref().map(|user| user.user_id);
+
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            Uuid,
+            Uuid,
+            Uuid,
+            Option<f64>,
+            Option<f64>,
+            String,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
         "SELECT id, entity_a_id, entity_b_id, attribute_id, rater_id,
                 ln_ratio, confidence, status, reasoning_text, created_at
          FROM judgements
          WHERE ($1::uuid IS NULL OR attribute_id = $1)
+           AND ($2::boolean OR user_id = $3)
          ORDER BY created_at DESC
-         LIMIT $2",
+         LIMIT $4",
     )
     .bind(params.attribute_id)
+    .bind(state.config.public_judgements)
+    .bind(auth_user_id)
     .bind(limit)
     .fetch_all(&state.db)
     .await?;
@@ -542,7 +711,7 @@ async fn list_judgements(
             ln_ratio: r.5,
             confidence: r.6,
             status: r.7,
-            reasoning_text: r.8,
+            reasoning_text: include_reasoning.then_some(r.8).flatten(),
             created_at: r.9,
         })
         .collect();
@@ -554,4 +723,38 @@ async fn list_judgements(
 struct ListJudgementsParams {
     attribute_id: Option<Uuid>,
     limit: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_llm_response;
+
+    #[test]
+    fn parse_llm_response_rejects_invalid_ratio() {
+        let raw = r#"{"higher_ranked":"A","ratio":0.5,"confidence":0.7}"#;
+        assert!(parse_llm_response(raw, false).is_err());
+    }
+
+    #[test]
+    fn parse_llm_response_accepts_valid_json() {
+        let raw = r#"{"higher_ranked":"A","ratio":2.0,"confidence":0.7}"#;
+        let (ln_ratio, confidence, status, reasoning) =
+            parse_llm_response(raw, false).expect("valid JSON should parse");
+
+        assert_eq!(status, "success");
+        assert_eq!(confidence, Some(0.7));
+        assert!(ln_ratio.expect("ratio should be present") > 0.0);
+        assert!(reasoning.is_none());
+    }
+
+    #[test]
+    fn parse_llm_response_accepts_fenced_json() {
+        let raw = "```json\n{\"higher_ranked\":\"B\",\"ratio\":2.0,\"confidence\":0.6}\n```";
+        let (ln_ratio, confidence, status, _) =
+            parse_llm_response(raw, false).expect("fenced JSON should parse");
+
+        assert_eq!(status, "success");
+        assert_eq!(confidence, Some(0.6));
+        assert!(ln_ratio.expect("ratio should be present") < 0.0);
+    }
 }

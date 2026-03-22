@@ -8,7 +8,7 @@ pub async fn get_balance(pool: &PgPool, user_id: Uuid) -> Result<i64, ApiError> 
     let balance = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT balance_after FROM credit_events
          WHERE user_id = $1
-         ORDER BY created_at DESC
+         ORDER BY created_at DESC, id DESC
          LIMIT 1",
     )
     .bind(user_id)
@@ -33,10 +33,12 @@ pub async fn grant_credits(
         return Err(ApiError::BadRequest("grant amount must be positive".into()));
     }
 
+    let mut tx = pool.begin().await.map_err(ApiError::Db)?;
+
     // Advisory lock to serialize credit mutations for this user
     sqlx::query("SELECT pg_advisory_xact_lock(credit_lock_key($1))")
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::Db)?;
 
@@ -47,15 +49,16 @@ pub async fn grant_credits(
     )
     .bind(user_id)
     .bind(idempotency_key)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(ApiError::Db)?;
 
     if let Some(balance) = existing {
+        tx.commit().await.map_err(ApiError::Db)?;
         return Ok(balance);
     }
 
-    let current_balance = get_balance(pool, user_id).await?;
+    let current_balance = current_balance(&mut tx, user_id).await?;
     let new_balance = current_balance + nanodollars;
 
     let balance_after = sqlx::query_scalar::<_, i64>(
@@ -68,10 +71,11 @@ pub async fn grant_credits(
     .bind(new_balance)
     .bind(idempotency_key)
     .bind(notes)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::Db)?;
 
+    tx.commit().await.map_err(ApiError::Db)?;
     Ok(balance_after)
 }
 
@@ -89,10 +93,12 @@ pub async fn burn_credits(
         return Err(ApiError::BadRequest("burn amount must be positive".into()));
     }
 
+    let mut tx = pool.begin().await.map_err(ApiError::Db)?;
+
     // Advisory lock
     sqlx::query("SELECT pg_advisory_xact_lock(credit_lock_key($1))")
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::Db)?;
 
@@ -103,15 +109,16 @@ pub async fn burn_credits(
     )
     .bind(user_id)
     .bind(idempotency_key)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(ApiError::Db)?;
 
     if let Some(balance) = existing {
+        tx.commit().await.map_err(ApiError::Db)?;
         return Ok(balance);
     }
 
-    let current_balance = get_balance(pool, user_id).await?;
+    let current_balance = current_balance(&mut tx, user_id).await?;
     let new_balance = current_balance - nanodollars;
 
     // The trigger will reject if new_balance < 0
@@ -126,7 +133,7 @@ pub async fn burn_credits(
     .bind(idempotency_key)
     .bind(related_object)
     .bind(notes)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         let msg = e.to_string();
@@ -137,5 +144,26 @@ pub async fn burn_credits(
         }
     })?;
 
+    tx.commit().await.map_err(ApiError::Db)?;
     Ok(balance_after)
+}
+
+async fn current_balance(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: Uuid,
+) -> Result<i64, ApiError> {
+    let balance = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT balance_after FROM credit_events
+         WHERE user_id = $1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApiError::Db)?
+    .flatten()
+    .unwrap_or(0);
+
+    Ok(balance)
 }

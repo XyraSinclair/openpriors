@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::auth::AppState;
+use crate::auth::{AppState, AuthUser};
 use crate::error::ApiError;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -38,10 +38,21 @@ async fn get_scores(
     Path(attribute_slug): Path<String>,
     Query(params): Query<ScoreParams>,
 ) -> Result<Json<Vec<ScoreRow>>, ApiError> {
-    let limit = params.limit.unwrap_or(100).min(1000);
-    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = params.offset.unwrap_or(0).max(0);
 
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, f64, Option<f64>, i32, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<String>,
+            f64,
+            Option<f64>,
+            i32,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
         "SELECT s.entity_id, e.uri, e.name, s.score, s.uncertainty,
                 s.comparison_count, s.solved_at
          FROM scores s
@@ -75,17 +86,19 @@ async fn get_scores(
 
 async fn solve_scores(
     State(state): State<Arc<AppState>>,
+    auth: AuthUser,
     Path(attribute_slug): Path<String>,
 ) -> Result<Json<SolveResult>, ApiError> {
+    auth.require_admin()?;
+    auth.require_scope("scores:solve")?;
+
     let pool = &state.db;
 
-    let attribute_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM attributes WHERE slug = $1",
-    )
-    .bind(&attribute_slug)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound(format!("attribute {attribute_slug}")))?;
+    let attribute_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM attributes WHERE slug = $1")
+        .bind(&attribute_slug)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("attribute {attribute_slug}")))?;
 
     let comparisons = sqlx::query_as::<_, (Uuid, Uuid, f64, f64, f64)>(
         "SELECT entity_a_id, entity_b_id, ln_ratio, confidence, repeats
@@ -116,9 +129,7 @@ async fn solve_scores(
         return Err(ApiError::BadRequest("need at least 2 entities".into()));
     }
 
-    use cardinal_harness::rating_engine::{
-        AttributeParams, Observation, RatingEngine,
-    };
+    use cardinal_harness::rating_engine::{AttributeParams, Observation, RatingEngine};
 
     let observations: Vec<Observation> = comparisons
         .iter()
@@ -145,7 +156,9 @@ async fn solve_scores(
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     engine.add_observations(&observations);
-    let summary = engine.solve();
+    let summary = tokio::task::spawn_blocking(move || engine.solve())
+        .await
+        .map_err(|e| ApiError::Internal(format!("score solve task failed: {e}")))?;
 
     let mut tx = pool.begin().await?;
 

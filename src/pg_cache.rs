@@ -22,10 +22,21 @@ impl PairwiseCache for PgPairwiseCache {
         let key_hash_bytes = hex::decode(&key.key_hash)
             .map_err(|e| CacheError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
 
-        let row = sqlx::query_as::<_, (Option<f64>, Option<f64>, String, Option<i32>, Option<i32>, Option<i64>)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<f64>,
+                Option<f64>,
+                String,
+                Option<i32>,
+                Option<i32>,
+                Option<i64>,
+            ),
+        >(
             "SELECT ln_ratio, confidence, status, input_tokens, output_tokens, cost_nanodollars
              FROM judgements
              WHERE prompt_hash = $1
+             AND cache_eligible = TRUE
              AND entity_a_id::text = $2
              AND entity_b_id::text = $3
              AND attribute_id IN (SELECT id FROM attributes WHERE slug = $4 OR id::text = $4)
@@ -70,7 +81,11 @@ impl PairwiseCache for PgPairwiseCache {
         }
     }
 
-    async fn put(&self, _key: &PairwiseCacheKey, _value: &CachedJudgement) -> Result<(), CacheError> {
+    async fn put(
+        &self,
+        _key: &PairwiseCacheKey,
+        _value: &CachedJudgement,
+    ) -> Result<(), CacheError> {
         // Writes happen via the judge endpoint, not through the cache trait.
         // The multi_rerank_with_trace loop calls put() after each comparison,
         // but we handle persistence in the ComparisonObserver instead.
