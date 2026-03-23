@@ -12,6 +12,48 @@ and propagate that measurement as far in the ecology as information technology a
 
 ---
 
+## Collaboration Mode
+
+This repo is in the fast direct-to-main collaboration set.
+
+Default git behavior:
+
+1. Before starting work, if the current checkout is clean:
+
+```bash
+git checkout main && git pull --rebase origin main
+```
+
+2. After a minimum good chunk of work:
+
+```bash
+git add <intentional-paths>
+git diff --cached --quiet || git commit -m "<clear message>"
+git pull --rebase origin main
+git push origin HEAD:main
+```
+
+Interpretation:
+
+- default to `main`; do not create branches unless there is a strong reason
+- commit small, coherent changes frequently
+- push soon after useful progress
+- pull with rebase, not merge
+- stage only the files you intentionally changed
+- do not use `git add -A` unless the entire worktree is intentionally part of
+  the task
+- never force-push `main`
+- if the checkout is already dirty with unrelated work, or another agent is
+  active, prefer a separate worktree or clean checkout rather than disturbing
+  existing state
+- if a rebase conflict is trivial, resolve it carefully; otherwise stop and
+  leave a clear note
+
+Background sync automation, if any, should default to `git fetch`, not blind
+`pull --rebase` against an active working tree.
+
+---
+
 ## Architecture
 
 - **API**: Rust (axum), `src/`
