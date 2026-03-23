@@ -21,16 +21,14 @@ Default git behavior:
 1. Before starting work, if the current checkout is clean:
 
 ```bash
-git checkout main && git pull --rebase origin main
+./scripts/sync_main.sh
 ```
 
 2. After a minimum good chunk of work:
 
 ```bash
 git add <intentional-paths>
-git diff --cached --quiet || git commit -m "<clear message>"
-git pull --rebase origin main
-git push origin HEAD:main
+./scripts/push_main.sh "<clear message>"
 ```
 
 Interpretation:
@@ -43,11 +41,13 @@ Interpretation:
 - do not use `git add -A` unless the entire worktree is intentionally part of
   the task
 - never force-push `main`
+- prefer the repo-local sync scripts over ad hoc git command sequences
 - if the checkout is already dirty with unrelated work, or another agent is
   active, prefer a separate worktree or clean checkout rather than disturbing
   existing state
-- if a rebase conflict is trivial, resolve it carefully; otherwise stop and
-  leave a clear note
+- if `push_main.sh` or `sync_main.sh` aborts because of a rebase conflict, do
+  not guess in a half-rebased state; handle it deliberately in a clean worktree
+  or branch
 
 Background sync automation, if any, should default to `git fetch`, not blind
 `pull --rebase` against an active working tree.
