@@ -7,12 +7,17 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use cardinal_harness::gateway::{Attribution, ChatModel, ChatRequest, Message};
+use cardinal_harness::gateway::{
+    confidence_from_logprobs, Attribution, ChatModel, ChatRequest, Message, PairwisePreferredSide,
+    TokenLogprob,
+};
+use cardinal_harness::prompts::RATIO_LADDER;
 use cardinal_harness::ChatGateway;
 
 use crate::auth::{AppState, AuthUser, MaybeAuth};
 use crate::db;
 use crate::error::ApiError;
+use crate::posterior::{derive_pairwise_posterior, output_logprobs_json, pairwise_posterior_json};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -87,11 +92,15 @@ struct JudgeResponse {
 }
 
 struct ParsedLlmResponse {
+    higher_ranked: Option<PairwisePreferredSide>,
+    ratio: Option<f64>,
     ln_ratio: Option<f64>,
     confidence: Option<f64>,
     status: String,
     reasoning: Option<String>,
 }
+
+const JUDGE_LOGPROBS_TOP_N: u32 = 20;
 
 async fn submit_judgement(
     State(state): State<Arc<AppState>>,
@@ -398,6 +407,11 @@ async fn submit_judgement(
         .temperature(0.0)
         .max_tokens(512)
         .json();
+        let chat_req = if model_supports_logprobs(model_id) {
+            chat_req.with_logprobs(JUDGE_LOGPROBS_TOP_N)
+        } else {
+            chat_req
+        };
 
         let start = std::time::Instant::now();
         let chat_resp = metering
@@ -409,20 +423,31 @@ async fn submit_judgement(
         // Parse LLM response
         let raw_output = &chat_resp.content;
         let ParsedLlmResponse {
+            higher_ranked,
+            ratio,
             ln_ratio,
             confidence,
             status,
             reasoning,
-        } = parse_llm_response(raw_output, flipped)?;
+        } = parse_llm_response(raw_output, chat_resp.output_logprobs.as_deref(), flipped)?;
+        let pairwise_posterior = higher_ranked.zip(ratio).and_then(|(higher_ranked, ratio)| {
+            derive_pairwise_posterior(chat_resp.output_logprobs.as_deref(), higher_ranked, ratio)
+        });
+        let output_logprobs_json = output_logprobs_json(chat_resp.output_logprobs.as_deref())
+            .map_err(|e| ApiError::Internal(format!("failed to serialize output logprobs: {e}")))?;
+        let structured_posterior_json = pairwise_posterior_json(pairwise_posterior.as_ref())
+            .map_err(|e| {
+                ApiError::Internal(format!("failed to serialize structured posterior: {e}"))
+            })?;
 
         let judgement_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO judgements
                (entity_a_id, entity_b_id, attribute_id, rater_id, user_id,
-                prompt_text, reasoning_text, raw_output,
+                prompt_text, reasoning_text, raw_output, output_logprobs_json, structured_posterior_json,
                 entity_a_text, entity_b_text, question_text,
                 ln_ratio, confidence, prompt_hash, status, cache_eligible,
                 input_tokens, output_tokens, cost_nanodollars, latency_ms)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE, $16, $17, $18, $19)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, TRUE, $17, $18, $19, $20)
              RETURNING id",
         )
         .bind(entity_a_id)
@@ -433,6 +458,8 @@ async fn submit_judgement(
         .bind(&prompt_text)
         .bind(&reasoning)
         .bind(raw_output)
+        .bind(output_logprobs_json)
+        .bind(structured_posterior_json)
         .bind(&entity_a_text)
         .bind(&entity_b_text)
         .bind(&attr_desc)
@@ -484,7 +511,11 @@ async fn submit_judgement(
 }
 
 /// Parse the LLM JSON response into (ln_ratio, confidence, status, reasoning).
-fn parse_llm_response(raw: &str, flipped: bool) -> Result<ParsedLlmResponse, ApiError> {
+fn parse_llm_response(
+    raw: &str,
+    output_logprobs: Option<&[TokenLogprob]>,
+    flipped: bool,
+) -> Result<ParsedLlmResponse, ApiError> {
     let normalized = strip_json_fence(raw);
     let parsed: serde_json::Value = serde_json::from_str(normalized)
         .map_err(|e| ApiError::Internal(format!("failed to parse LLM output: {e}")))?;
@@ -499,6 +530,8 @@ fn parse_llm_response(raw: &str, flipped: bool) -> Result<ParsedLlmResponse, Api
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         return Ok(ParsedLlmResponse {
+            higher_ranked: None,
+            ratio: None,
             ln_ratio: None,
             confidence: None,
             status: "refused".to_string(),
@@ -519,21 +552,30 @@ fn parse_llm_response(raw: &str, flipped: bool) -> Result<ParsedLlmResponse, Api
         return Err(ApiError::Internal("invalid ratio in LLM output".into()));
     }
 
-    let confidence = parsed
-        .get("confidence")
-        .and_then(|v| v.as_f64())
-        .map(validate_confidence)
-        .transpose()?;
-
-    // Convert to ln_ratio in canonical (a < b) order
-    let a_is_higher = match higher {
-        "A" => !flipped,
-        "B" => flipped,
+    let higher_ranked = match higher {
+        "A" => PairwisePreferredSide::A,
+        "B" => PairwisePreferredSide::B,
         _ => {
             return Err(ApiError::Internal(format!(
                 "invalid higher_ranked: {higher}"
             )))
         }
+    };
+
+    let confidence = parsed
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .map(validate_confidence)
+        .transpose()?;
+    let confidence = output_logprobs
+        .and_then(|logprobs| confidence_from_logprobs(logprobs, higher_ranked, ratio, RATIO_LADDER))
+        .map(|source| source.as_scalar())
+        .or(confidence);
+
+    // Convert to ln_ratio in canonical (a < b) order
+    let a_is_higher = match higher_ranked {
+        PairwisePreferredSide::A => !flipped,
+        PairwisePreferredSide::B => flipped,
     };
 
     let ln_ratio = if a_is_higher {
@@ -543,11 +585,17 @@ fn parse_llm_response(raw: &str, flipped: bool) -> Result<ParsedLlmResponse, Api
     };
 
     Ok(ParsedLlmResponse {
+        higher_ranked: Some(higher_ranked),
+        ratio: Some(ratio),
         ln_ratio: Some(ln_ratio),
         confidence,
         status: "success".to_string(),
         reasoning: None, // reasoning is in the raw output
     })
+}
+
+fn model_supports_logprobs(model_id: &str) -> bool {
+    model_id.starts_with("openai/")
 }
 
 fn strip_json_fence(raw: &str) -> &str {
@@ -742,17 +790,18 @@ struct ListJudgementsParams {
 #[cfg(test)]
 mod tests {
     use super::parse_llm_response;
+    use cardinal_harness::gateway::{TokenAlternative, TokenLogprob};
 
     #[test]
     fn parse_llm_response_rejects_invalid_ratio() {
         let raw = r#"{"higher_ranked":"A","ratio":0.5,"confidence":0.7}"#;
-        assert!(parse_llm_response(raw, false).is_err());
+        assert!(parse_llm_response(raw, None, false).is_err());
     }
 
     #[test]
     fn parse_llm_response_accepts_valid_json() {
         let raw = r#"{"higher_ranked":"A","ratio":2.0,"confidence":0.7}"#;
-        let parsed = parse_llm_response(raw, false).expect("valid JSON should parse");
+        let parsed = parse_llm_response(raw, None, false).expect("valid JSON should parse");
 
         assert_eq!(parsed.status, "success");
         assert_eq!(parsed.confidence, Some(0.7));
@@ -763,10 +812,40 @@ mod tests {
     #[test]
     fn parse_llm_response_accepts_fenced_json() {
         let raw = "```json\n{\"higher_ranked\":\"B\",\"ratio\":2.0,\"confidence\":0.6}\n```";
-        let parsed = parse_llm_response(raw, false).expect("fenced JSON should parse");
+        let parsed = parse_llm_response(raw, None, false).expect("fenced JSON should parse");
 
         assert_eq!(parsed.status, "success");
         assert_eq!(parsed.confidence, Some(0.6));
         assert!(parsed.ln_ratio.expect("ratio should be present") < 0.0);
+    }
+
+    #[test]
+    fn parse_llm_response_uses_logprob_confidence_when_missing() {
+        let raw = r#"{"higher_ranked":"A","ratio":2.5}"#;
+        let logprobs = vec![
+            TokenLogprob {
+                token: "\"A\"".to_string(),
+                logprob: -0.1,
+                top_alternatives: vec![TokenAlternative {
+                    token: "\"B\"".to_string(),
+                    logprob: -2.3,
+                }],
+            },
+            TokenLogprob {
+                token: "2.5".to_string(),
+                logprob: -0.22,
+                top_alternatives: vec![TokenAlternative {
+                    token: "2.1".to_string(),
+                    logprob: -1.61,
+                }],
+            },
+        ];
+
+        let parsed =
+            parse_llm_response(raw, Some(&logprobs), false).expect("logprob fallback should work");
+
+        assert_eq!(parsed.status, "success");
+        let confidence = parsed.confidence.expect("confidence should be derived");
+        assert!(confidence > 0.7, "confidence={confidence}");
     }
 }

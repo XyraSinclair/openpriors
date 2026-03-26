@@ -12,6 +12,7 @@ use cardinal_harness::rerank::{
 
 use crate::auth::{AppState, AuthUser};
 use crate::error::ApiError;
+use crate::judgement_observer::PgJudgementObserver;
 use crate::pg_cache::PgPairwiseCache;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -238,6 +239,7 @@ async fn rate(
     ));
 
     let pg_cache = PgPairwiseCache::new(state.db.clone());
+    let observer = PgJudgementObserver::new(state.db.clone(), auth.user_id);
 
     let attribution = Attribution::new("openpriors::rate").with_user(auth.user_id);
 
@@ -250,7 +252,7 @@ async fn rate(
         rerank_req,
         attribution,
         None, // warm_start
-        None, // observer
+        Some(&observer as &dyn cardinal_harness::rerank::ComparisonObserver),
         None, // trace
         None, // cancel_flag
     )

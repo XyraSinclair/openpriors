@@ -101,6 +101,8 @@ CREATE TABLE judgements (
     prompt_text     TEXT NOT NULL,
     reasoning_text  TEXT,                   -- chain-of-thought / reasoning trace
     raw_output      TEXT NOT NULL,          -- complete LLM response
+    output_logprobs_json JSONB,            -- token-level posterior slice for structured outputs
+    structured_posterior_json JSONB,       -- derived structured posterior / uncertainty summary
 
     -- Entity text snapshots (for cache key integrity)
     entity_a_text   TEXT,
